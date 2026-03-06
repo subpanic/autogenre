@@ -672,6 +672,9 @@ def choose_musicbrainz_candidate(
     while True:
         try:
             raw = input(f"Select MusicBrainz match [Enter=1, 0-{len(candidates)}]: ").strip()
+        except KeyboardInterrupt:
+            print()
+            raise
         except EOFError:
             print()
             logging.warning("Input ended; defaulting to top MusicBrainz match")
@@ -713,6 +716,9 @@ def choose_bandcamp_candidate(
     while True:
         try:
             raw = input(f"Select Bandcamp match [Enter=1, 0-{len(candidates)}]: ").strip()
+        except KeyboardInterrupt:
+            print()
+            raise
         except EOFError:
             print()
             logging.warning("Input ended; defaulting to top Bandcamp match")
@@ -814,6 +820,13 @@ def process_release(
     return (changed_files, 0)
 
 
+def safe_release_fingerprint(release: Release) -> str:
+    try:
+        return release.fingerprint()
+    except Exception:
+        return ""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -890,47 +903,68 @@ def main() -> int:
         )
         interactive = False
 
-    releases = discover_releases(root)
-    if not releases:
-        logging.info("No releases found under %s", root)
-        db.close()
+    try:
+        releases = discover_releases(root)
+        if not releases:
+            logging.info("No releases found under %s", root)
+            return 0
+
+        logging.info("Discovered %d releases", len(releases))
+        total_changed = 0
+        total_skipped = 0
+
+        for release in releases:
+            try:
+                changed, skipped = process_release(
+                    release=release,
+                    db=db,
+                    musicbrainz=musicbrainz,
+                    bandcamp=bandcamp,
+                    dry_run=args.dry_run,
+                    interactive=interactive,
+                )
+                total_changed += changed
+                total_skipped += skipped
+            except KeyboardInterrupt:
+                db.mark(
+                    release=release,
+                    fingerprint=safe_release_fingerprint(release),
+                    status="interrupted",
+                    notes="KeyboardInterrupt",
+                )
+                logging.warning(
+                    "Interrupted during release: %s / %s",
+                    release.folder,
+                    release.album,
+                )
+                raise
+            except Exception as exc:
+                db.mark(
+                    release=release,
+                    fingerprint=safe_release_fingerprint(release),
+                    status="error",
+                    notes=str(exc),
+                )
+                logging.exception(
+                    "Failed release %s / %s: %s",
+                    release.folder,
+                    release.album,
+                    exc,
+                )
+
+        logging.info(
+            "Done. releases=%d changed_files=%d skipped_releases=%d state_db=%s",
+            len(releases),
+            total_changed,
+            total_skipped,
+            db_path,
+        )
         return 0
-
-    logging.info("Discovered %d releases", len(releases))
-    total_changed = 0
-    total_skipped = 0
-
-    for release in releases:
-        try:
-            changed, skipped = process_release(
-                release=release,
-                db=db,
-                musicbrainz=musicbrainz,
-                bandcamp=bandcamp,
-                dry_run=args.dry_run,
-                interactive=interactive,
-            )
-            total_changed += changed
-            total_skipped += skipped
-        except Exception as exc:
-            fingerprint = release.fingerprint()
-            db.mark(
-                release=release,
-                fingerprint=fingerprint,
-                status="error",
-                notes=str(exc),
-            )
-            logging.exception("Failed release %s / %s: %s", release.folder, release.album, exc)
-
-    db.close()
-    logging.info(
-        "Done. releases=%d changed_files=%d skipped_releases=%d state_db=%s",
-        len(releases),
-        total_changed,
-        total_skipped,
-        db_path,
-    )
-    return 0
+    except KeyboardInterrupt:
+        logging.warning("Interrupted by user (Ctrl-C). Progress saved in %s", db_path)
+        return 130
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
