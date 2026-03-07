@@ -736,14 +736,14 @@ def choose_bandcamp_candidate(
 
 def process_release(
     release: Release,
-    db: ReleaseDatabase,
+    db: ReleaseDatabase | None,
     musicbrainz: MusicBrainzClient | None,
     bandcamp: BandcampClient | None,
     dry_run: bool,
     interactive: bool,
 ) -> tuple[int, int]:
-    fingerprint = release.fingerprint()
-    if db.is_completed(release.release_id, fingerprint):
+    fingerprint = release.fingerprint() if db else ""
+    if db and db.is_completed(release.release_id, fingerprint):
         logging.info("Skipping already-complete release: %s / %s", release.folder, release.album)
         return (0, 1)
 
@@ -792,22 +792,23 @@ def process_release(
     after_mb = merge_tags(existing, mb_tags)
     after_mb_keys = {canonical_genre(x) for x in after_mb}
 
-    notes = json.dumps(
-        {
-            "existing": existing,
-            "musicbrainz_candidates": len(mb_candidates),
-            "musicbrainz_selected": selected_mb.release_id if selected_mb else None,
-            "musicbrainz_added": [t for t in mb_tags if canonical_genre(t) not in existing_keys],
-            "bandcamp_candidates": len(bc_candidates),
-            "bandcamp_selected": selected_bc.url if selected_bc else None,
-            "bandcamp_added": [t for t in bc_tags if canonical_genre(t) not in after_mb_keys],
-            "changed_files": changed_files,
-            "dry_run": dry_run,
-            "interactive": interactive,
-        }
-    )
-    status = "dry_run" if dry_run else "ok"
-    db.mark(release, fingerprint, status, genres=target, notes=notes)
+    if db:
+        notes = json.dumps(
+            {
+                "existing": existing,
+                "musicbrainz_candidates": len(mb_candidates),
+                "musicbrainz_selected": selected_mb.release_id if selected_mb else None,
+                "musicbrainz_added": [t for t in mb_tags if canonical_genre(t) not in existing_keys],
+                "bandcamp_candidates": len(bc_candidates),
+                "bandcamp_selected": selected_bc.url if selected_bc else None,
+                "bandcamp_added": [t for t in bc_tags if canonical_genre(t) not in after_mb_keys],
+                "changed_files": changed_files,
+                "dry_run": dry_run,
+                "interactive": interactive,
+            }
+        )
+        status = "dry_run" if dry_run else "ok"
+        db.mark(release, fingerprint, status, genres=target, notes=notes)
 
     logging.info(
         "Processed: %s / %s | tracks=%d changed=%d genres=%s",
@@ -835,6 +836,14 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("root", type=Path, help="Root folder to scan recursively")
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help=(
+            "Process release(s) from the provided path directly and skip "
+            "SQLite resume/state tracking"
+        ),
+    )
     parser.add_argument(
         "--db-path",
         type=Path,
@@ -890,9 +899,18 @@ def main() -> int:
         logging.error("Root folder does not exist or is not a directory: %s", root)
         return 1
 
-    db_path = args.db_path.expanduser().resolve() if args.db_path else root / ".release_genre_sync.sqlite3"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    db = ReleaseDatabase(db_path)
+    db: ReleaseDatabase | None = None
+    db_path: Path | None = None
+    if not args.direct:
+        db_path = (
+            args.db_path.expanduser().resolve()
+            if args.db_path
+            else root / ".release_genre_sync.sqlite3"
+        )
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = ReleaseDatabase(db_path)
+    elif args.db_path:
+        logging.warning("--db-path is ignored when --direct is set")
 
     musicbrainz = None if args.no_musicbrainz else MusicBrainzClient(contact=args.musicbrainz_contact)
     bandcamp = None if args.no_bandcamp else BandcampClient()
@@ -926,12 +944,13 @@ def main() -> int:
                 total_changed += changed
                 total_skipped += skipped
             except KeyboardInterrupt:
-                db.mark(
-                    release=release,
-                    fingerprint=safe_release_fingerprint(release),
-                    status="interrupted",
-                    notes="KeyboardInterrupt",
-                )
+                if db:
+                    db.mark(
+                        release=release,
+                        fingerprint=safe_release_fingerprint(release),
+                        status="interrupted",
+                        notes="KeyboardInterrupt",
+                    )
                 logging.warning(
                     "Interrupted during release: %s / %s",
                     release.folder,
@@ -939,12 +958,13 @@ def main() -> int:
                 )
                 raise
             except Exception as exc:
-                db.mark(
-                    release=release,
-                    fingerprint=safe_release_fingerprint(release),
-                    status="error",
-                    notes=str(exc),
-                )
+                if db:
+                    db.mark(
+                        release=release,
+                        fingerprint=safe_release_fingerprint(release),
+                        status="error",
+                        notes=str(exc),
+                    )
                 logging.exception(
                     "Failed release %s / %s: %s",
                     release.folder,
@@ -952,19 +972,31 @@ def main() -> int:
                     exc,
                 )
 
-        logging.info(
-            "Done. releases=%d changed_files=%d skipped_releases=%d state_db=%s",
-            len(releases),
-            total_changed,
-            total_skipped,
-            db_path,
-        )
+        if db_path:
+            logging.info(
+                "Done. releases=%d changed_files=%d skipped_releases=%d state_db=%s",
+                len(releases),
+                total_changed,
+                total_skipped,
+                db_path,
+            )
+        else:
+            logging.info(
+                "Done. releases=%d changed_files=%d skipped_releases=%d (direct mode)",
+                len(releases),
+                total_changed,
+                total_skipped,
+            )
         return 0
     except KeyboardInterrupt:
-        logging.warning("Interrupted by user (Ctrl-C). Progress saved in %s", db_path)
+        if db_path:
+            logging.warning("Interrupted by user (Ctrl-C). Progress saved in %s", db_path)
+        else:
+            logging.warning("Interrupted by user (Ctrl-C)")
         return 130
     finally:
-        db.close()
+        if db:
+            db.close()
 
 
 if __name__ == "__main__":
